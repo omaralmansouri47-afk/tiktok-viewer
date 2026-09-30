@@ -1,340 +1,234 @@
-// Netlify function: obtiene datos públicos de un perfil de TikTok mediante Apify
+// Netlify Function: consulta en vivo de perfiles públicos de TikTok mediante Apify
+// La variable APIFY_TOKEN debe estar configurada en Netlify.
+// Nunca escribas el token directamente aquí.
 
 const APIFY_TOKEN = process.env.APIFY_TOKEN;
+const USERNAME_REGEX = /^[A-Za-z0-9._]{2,24}$/;
 
-const APIFY_URL =
-  "https://api.apify.com/v2/acts/novi~tiktok-user-info-api/run-sync-get-dataset-items?token=";
-
-function reply(statusCode, body) {
+function response(statusCode, data) {
   return {
     statusCode,
     headers: {
-      "Content-Type": "application/json",
-      "Cache-Control": "no-store"
+      "Content-Type": "application/json; charset=utf-8",
+      "Cache-Control": "no-store, no-cache, must-revalidate, proxy-revalidate",
+      Pragma: "no-cache",
+      Expires: "0",
+      "Access-Control-Allow-Origin": "*"
     },
-    body: JSON.stringify(body)
+    body: JSON.stringify(data)
   };
 }
 
 function firstValue(...values) {
-  for (const value of values) {
-    if (value !== undefined && value !== null && value !== "") {
-      return value;
-    }
-  }
-
-  return null;
-}
-
-function numberOrNull(...values) {
-  const value = firstValue(...values);
-
-  if (value === null) {
-    return null;
-  }
-
-  const text = String(value)
-    .replace(/,/g, "")
-    .trim()
-    .toUpperCase();
-
-  if (!text) {
-    return null;
-  }
-
-  let multiplier = 1;
-
-  if (text.endsWith("K")) {
-    multiplier = 1000;
-  } else if (text.endsWith("M")) {
-    multiplier = 1000000;
-  } else if (text.endsWith("B")) {
-    multiplier = 1000000000;
-  }
-
-  const number = Number(text.replace(/[KMB]$/, "")) * multiplier;
-
-  return Number.isFinite(number) ? Math.round(number) : null;
-}
-
-function booleanValue(...values) {
-  const value = firstValue(...values);
-
-  return (
-    value === true ||
-    value === 1 ||
-    value === "1" ||
-    value === "true"
+  return values.find(
+    value => value !== undefined && value !== null && value !== ""
   );
 }
 
-function avatarUrl(profile) {
-  const possibleValues = [
-    profile.avatarLarger,
-    profile.avatarMedium,
-    profile.avatarThumb,
-    profile.avatarUrl,
-    profile.profilePictureUrl,
-    profile.avatar,
-    profile.avatar_url,
-    profile.avatar_300x300,
-    profile.avatar_168x168
-  ];
-
-  for (const value of possibleValues) {
-    if (typeof value === "string" && value.startsWith("http")) {
-      return value;
-    }
-
-    if (
-      value &&
-      Array.isArray(value.url_list) &&
-      typeof value.url_list[0] === "string"
-    ) {
-      return value.url_list[0];
-    }
-
-    if (
-      value &&
-      Array.isArray(value.urlList) &&
-      typeof value.urlList[0] === "string"
-    ) {
-      return value.urlList[0];
-    }
-  }
-
-  return "";
-}
-
-function looksLikeProfile(value) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    return false;
-  }
-
-  const profileFields = [
-    "username",
-    "uniqueId",
-    "unique_id",
-    "nickname",
-    "nickname",
-    "uid",
-    "followerCount",
-    "follower_count",
-    "followingCount",
-    "following_count",
-    "avatarLarger",
-    "avatar_300x300",
-    "avatar_168x168"
-  ];
-
-  return profileFields.some((field) =>
-    Object.prototype.hasOwnProperty.call(value, field)
-  );
-}
-
-function findProfile(value, depth = 0) {
-  if (!value || depth > 8) {
+function numberOrNull(value) {
+  if (value === undefined || value === null || value === "") {
     return null;
   }
 
-  if (Array.isArray(value)) {
-    for (const item of value) {
-      const result = findProfile(item, depth + 1);
+  const number = Number(String(value).replace(/,/g, ""));
 
-      if (result) {
-        return result;
-      }
-    }
-
-    return null;
-  }
-
-  if (typeof value !== "object") {
-    return null;
-  }
-
-  if (looksLikeProfile(value)) {
-    return value;
-  }
-
-  const priorityKeys = [
-    "data",
-    "items",
-    "results",
-    "result",
-    "profile",
-    "user",
-    "userInfo",
-    "users"
-  ];
-
-  for (const key of priorityKeys) {
-    if (value[key]) {
-      const result = findProfile(value[key], depth + 1);
-
-      if (result) {
-        return result;
-      }
-    }
-  }
-
-  for (const child of Object.values(value)) {
-    const result = findProfile(child, depth + 1);
-
-    if (result) {
-      return result;
-    }
-  }
-
-  return null;
+  return Number.isFinite(number) ? number : null;
 }
 
-exports.handler = async (event) => {
-  const params = event?.queryStringParameters || {};
+function booleanValue(value) {
+  return value === true || value === "true" || value === 1;
+}
 
-  const username = String(
-    firstValue(params.username, params.user) || ""
-  )
-    .trim()
-    .replace(/^@/, "")
-    .replace(/[^a-zA-Z0-9._-]/g, "");
+exports.handler = async function handler(event) {
+  if (event.httpMethod === "OPTIONS") {
+    return {
+      statusCode: 204,
+      headers: {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type"
+      },
+      body: ""
+    };
+  }
 
-  if (!username) {
-    return reply(400, {
+  const params = event.queryStringParameters || {};
+  const rawUsername = String(params.username || "").trim();
+  const username = rawUsername.replace(/^@+/, "");
+
+  // No transforma nombres inválidos en otros nombres.
+  if (!USERNAME_REGEX.test(username)) {
+    return response(400, {
       ok: false,
-      error: "Missing username"
+      error: "Invalid TikTok username"
     });
   }
 
   if (!APIFY_TOKEN) {
-    return reply(500, {
+    return response(500, {
       ok: false,
-      error: "APIFY_TOKEN not set"
+      error: "APIFY_TOKEN is not configured"
     });
   }
 
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 25000);
+
   try {
-    const response = await fetch(
-      APIFY_URL + encodeURIComponent(APIFY_TOKEN),
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Accept: "application/json"
-        },
-        body: JSON.stringify({
-          usernames: [username]
-        })
+    const apifyUrl =
+      "https://api.apify.com/v2/acts/" +
+      "novi~tiktok-user-info-api/run-sync-get-dataset-items?token=" +
+      encodeURIComponent(APIFY_TOKEN);
+
+    const providerResponse = await fetch(apifyUrl, {
+      method: "POST",
+      signal: controller.signal,
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json"
+      },
+      body: JSON.stringify({
+        usernames: [username],
+        source: "tiktok"
+      })
+    });
+
+    if (!providerResponse.ok) {
+      if (providerResponse.status === 429) {
+        return response(429, {
+          ok: false,
+          error: "Too many requests"
+        });
       }
-    );
 
-    const responseText = await response.text();
-
-    let data;
-
-    try {
-      data = JSON.parse(responseText);
-    } catch {
-      data = null;
-    }
-
-    if (!response.ok) {
-      return reply(502, {
+      return response(502, {
         ok: false,
-        error: "Apify error " + response.status
+        error: "TikTok provider request failed",
+        providerStatus: providerResponse.status
       });
     }
 
-    const source = findProfile(data);
+    const payload = await providerResponse.json();
 
-    if (!source) {
-      return reply(404, {
+    const rows = Array.isArray(payload)
+      ? payload
+      : Array.isArray(payload?.data)
+        ? payload.data
+        : Array.isArray(payload?.items)
+          ? payload.items
+          : [];
+
+    const row =
+      rows[0] ||
+      payload?.profile ||
+      payload?.user ||
+      payload?.userInfo ||
+      null;
+
+    if (!row || typeof row !== "object") {
+      return response(404, {
         ok: false,
-        error: "Profile not found"
+        error: "TikTok profile not found"
       });
     }
+
+    const profileData =
+      row.profile ||
+      row.user ||
+      row.userInfo ||
+      row.data ||
+      row;
 
     const handle = String(
       firstValue(
-        source.username,
-        source.uniqueId,
-        source.unique_id,
+        profileData.username,
+        profileData.uniqueId,
+        profileData.unique_id,
+        profileData.userName,
+        profileData.handle,
         username
       )
-    ).replace(/^@/, "");
+    ).replace(/^@+/, "");
 
-    const name = String(
-      firstValue(
-        source.nickname,
-        source.nickName,
-        source.name,
-        handle
-      )
-    );
-
-    const profile = {
-      handle,
-      name,
-      avatar: avatarUrl(source),
-
-      following: numberOrNull(
-        source.following,
-        source.followingCount,
-        source.following_count
-      ),
-
-      followers: numberOrNull(
-        source.followers,
-        source.followerCount,
-        source.follower_count,
-        source.fans
-      ),
-
-      likes: numberOrNull(
-        source.likes,
-        source.likesCount,
-        source.heart,
-        source.heartCount,
-        source.heart_count,
-        source.total_favorited
-      ),
-
-      bio: String(
-        firstValue(
-          source.bio,
-          source.signature,
-          source.description,
-          ""
-        )
-      ),
-
-      verified: booleanValue(
-        source.verified,
-        source.isVerified,
-        source.is_verified
-      )
-    };
-
-    if (!profile.handle || !profile.name) {
-      return reply(404, {
+    if (!USERNAME_REGEX.test(handle)) {
+      return response(404, {
         ok: false,
-        error: "Profile not found"
+        error: "TikTok profile not found"
       });
     }
 
-    return reply(200, {
+    const profile = {
+      handle,
+      name: String(
+        firstValue(
+          profileData.nickname,
+          profileData.nickName,
+          profileData.displayName,
+          profileData.name,
+          handle
+        )
+      ),
+      avatar: String(
+        firstValue(
+          profileData.avatarLarger,
+          profileData.avatar,
+          profileData.avatarUrl,
+          profileData.avatar_url,
+          ""
+        )
+      ),
+      following: numberOrNull(
+        firstValue(
+          profileData.following,
+          profileData.followingCount,
+          profileData.stats?.followingCount
+        )
+      ),
+      followers: numberOrNull(
+        firstValue(
+          profileData.followers,
+          profileData.followerCount,
+          profileData.fans,
+          profileData.stats?.followerCount
+        )
+      ),
+      likes: numberOrNull(
+        firstValue(
+          profileData.likes,
+          profileData.heart,
+          profileData.heartCount,
+          profileData.stats?.heartCount
+        )
+      ),
+      bio: String(
+        firstValue(
+          profileData.bio,
+          profileData.signature,
+          profileData.description,
+          ""
+        )
+      ),
+      verified: booleanValue(profileData.verified)
+    };
+
+    return response(200, {
       ok: true,
-
-      // Es importante que diga exactamente "tiktok".
-      // La página actual comprueba este valor.
       source: "tiktok",
-
       profile
     });
   } catch (error) {
-    return reply(500, {
+    if (error.name === "AbortError") {
+      return response(504, {
+        ok: false,
+        error: "TikTok provider timeout"
+      });
+    }
+
+    return response(502, {
       ok: false,
-      error: "Server error"
+      error: "TikTok provider unavailable"
     });
+  } finally {
+    clearTimeout(timeout);
   }
 };
