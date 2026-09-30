@@ -1,19 +1,65 @@
-// Netlify function: busca perfiles de TikTok directamente por username
+// Netlify function: obtiene datos públicos de un perfil de TikTok mediante Apify
 
 const APIFY_TOKEN = process.env.APIFY_TOKEN;
 
-function numberOrNull(value) {
-  if (value === undefined || value === null || value === "") {
+const APIFY_URL =
+  "https://api.apify.com/v2/acts/novi~tiktok-user-info-api/run-sync-get-dataset-items?token=";
+
+function reply(statusCode, body) {
+  return {
+    statusCode,
+    headers: {
+      "Content-Type": "application/json",
+      "Cache-Control": "no-store"
+    },
+    body: JSON.stringify(body)
+  };
+}
+
+function firstValue(...values) {
+  for (const value of values) {
+    if (value !== undefined && value !== null && value !== "") {
+      return value;
+    }
+  }
+
+  return null;
+}
+
+function numberOrNull(...values) {
+  const value = firstValue(...values);
+
+  if (value === null) {
     return null;
   }
 
-  const cleaned = String(value).replace(/,/g, "").trim();
-  const number = Number(cleaned);
+  const text = String(value)
+    .replace(/,/g, "")
+    .trim()
+    .toUpperCase();
 
-  return Number.isFinite(number) ? number : null;
+  if (!text) {
+    return null;
+  }
+
+  let multiplier = 1;
+
+  if (text.endsWith("K")) {
+    multiplier = 1000;
+  } else if (text.endsWith("M")) {
+    multiplier = 1000000;
+  } else if (text.endsWith("B")) {
+    multiplier = 1000000000;
+  }
+
+  const number = Number(text.replace(/[KMB]$/, "")) * multiplier;
+
+  return Number.isFinite(number) ? Math.round(number) : null;
 }
 
-function booleanValue(value) {
+function booleanValue(...values) {
+  const value = firstValue(...values);
+
   return (
     value === true ||
     value === 1 ||
@@ -22,46 +68,81 @@ function booleanValue(value) {
   );
 }
 
-function profileScore(object) {
-  if (!object || typeof object !== "object") {
-    return 0;
+function avatarUrl(profile) {
+  const possibleValues = [
+    profile.avatarLarger,
+    profile.avatarMedium,
+    profile.avatarThumb,
+    profile.avatarUrl,
+    profile.profilePictureUrl,
+    profile.avatar,
+    profile.avatar_url,
+    profile.avatar_300x300,
+    profile.avatar_168x168
+  ];
+
+  for (const value of possibleValues) {
+    if (typeof value === "string" && value.startsWith("http")) {
+      return value;
+    }
+
+    if (
+      value &&
+      Array.isArray(value.url_list) &&
+      typeof value.url_list[0] === "string"
+    ) {
+      return value.url_list[0];
+    }
+
+    if (
+      value &&
+      Array.isArray(value.urlList) &&
+      typeof value.urlList[0] === "string"
+    ) {
+      return value.urlList[0];
+    }
   }
 
-  const keys = [
+  return "";
+}
+
+function looksLikeProfile(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+
+  const profileFields = [
     "username",
     "uniqueId",
     "unique_id",
     "nickname",
+    "nickname",
+    "uid",
     "followerCount",
-    "followersCount",
+    "follower_count",
     "followingCount",
-    "heartCount",
-    "likesCount",
+    "following_count",
     "avatarLarger",
-    "avatar",
-    "signature",
-    "bio",
-    "verified"
+    "avatar_300x300",
+    "avatar_168x168"
   ];
 
-  return keys.reduce((score, key) => {
-    return score + (
-      Object.prototype.hasOwnProperty.call(object, key) ? 1 : 0
-    );
-  }, 0);
+  return profileFields.some((field) =>
+    Object.prototype.hasOwnProperty.call(value, field)
+  );
 }
 
 function findProfile(value, depth = 0) {
-  if (!value || depth > 6) {
+  if (!value || depth > 8) {
     return null;
   }
 
   if (Array.isArray(value)) {
     for (const item of value) {
-      const found = findProfile(item, depth + 1);
+      const result = findProfile(item, depth + 1);
 
-      if (found) {
-        return found;
+      if (result) {
+        return result;
       }
     }
 
@@ -72,34 +153,36 @@ function findProfile(value, depth = 0) {
     return null;
   }
 
-  if (profileScore(value) > 0) {
+  if (looksLikeProfile(value)) {
     return value;
   }
 
   const priorityKeys = [
-    "userInfo",
+    "data",
+    "items",
+    "results",
+    "result",
     "profile",
     "user",
-    "account",
-    "result",
-    "data"
+    "userInfo",
+    "users"
   ];
 
   for (const key of priorityKeys) {
     if (value[key]) {
-      const found = findProfile(value[key], depth + 1);
+      const result = findProfile(value[key], depth + 1);
 
-      if (found) {
-        return found;
+      if (result) {
+        return result;
       }
     }
   }
 
   for (const child of Object.values(value)) {
-    const found = findProfile(child, depth + 1);
+    const result = findProfile(child, depth + 1);
 
-    if (found) {
-      return found;
+    if (result) {
+      return result;
     }
   }
 
@@ -107,43 +190,37 @@ function findProfile(value, depth = 0) {
 }
 
 exports.handler = async (event) => {
-  const params = event.queryStringParameters || {};
+  const params = event?.queryStringParameters || {};
 
   const username = String(
-    params.username || params.user || ""
+    firstValue(params.username, params.user) || ""
   )
+    .trim()
     .replace(/^@/, "")
-    .replace(/[^a-zA-Z0-9._-]/g, "")
-    .trim();
+    .replace(/[^a-zA-Z0-9._-]/g, "");
 
   if (!username) {
-    return {
-      statusCode: 400,
-      body: JSON.stringify({
-        ok: false,
-        error: "Missing username"
-      })
-    };
+    return reply(400, {
+      ok: false,
+      error: "Missing username"
+    });
   }
 
   if (!APIFY_TOKEN) {
-    return {
-      statusCode: 500,
-      body: JSON.stringify({
-        ok: false,
-        error: "APIFY_TOKEN not set"
-      })
-    };
+    return reply(500, {
+      ok: false,
+      error: "APIFY_TOKEN not set"
+    });
   }
 
   try {
     const response = await fetch(
-      "https://api.apify.com/v2/acts/novi~tiktok-user-info-api/run-sync-get-dataset-items?token=" +
-        encodeURIComponent(APIFY_TOKEN),
+      APIFY_URL + encodeURIComponent(APIFY_TOKEN),
       {
         method: "POST",
         headers: {
-          "Content-Type": "application/json"
+          "Content-Type": "application/json",
+          Accept: "application/json"
         },
         body: JSON.stringify({
           usernames: [username]
@@ -151,108 +228,113 @@ exports.handler = async (event) => {
       }
     );
 
-    if (!response.ok) {
-      return {
-        statusCode: 502,
-        body: JSON.stringify({
-          ok: false,
-          error: "Apify error " + response.status
-        })
-      };
+    const responseText = await response.text();
+
+    let data;
+
+    try {
+      data = JSON.parse(responseText);
+    } catch {
+      data = null;
     }
 
-    const raw = await response.json();
-    const source = findProfile(raw);
+    if (!response.ok) {
+      return reply(502, {
+        ok: false,
+        error: "Apify error " + response.status
+      });
+    }
+
+    const source = findProfile(data);
 
     if (!source) {
-      return {
-        statusCode: 404,
-        body: JSON.stringify({
-          ok: false,
-          error: "Profile not found"
-        })
-      };
+      return reply(404, {
+        ok: false,
+        error: "Profile not found"
+      });
     }
 
     const handle = String(
-      source.username ||
-      source.uniqueId ||
-      source.unique_id ||
-      username
+      firstValue(
+        source.username,
+        source.uniqueId,
+        source.unique_id,
+        username
+      )
+    ).replace(/^@/, "");
+
+    const name = String(
+      firstValue(
+        source.nickname,
+        source.nickName,
+        source.name,
+        handle
+      )
     );
 
     const profile = {
-      handle: handle,
-
-      name: String(
-        source.nickname ||
-        source.nickName ||
-        source.name ||
-        handle
-      ),
-
-      avatar: String(
-        source.avatarLarger ||
-        source.avatarMedium ||
-        source.avatarThumb ||
-        source.avatarUrl ||
-        source.profilePictureUrl ||
-        source.avatar ||
-        ""
-      ),
+      handle,
+      name,
+      avatar: avatarUrl(source),
 
       following: numberOrNull(
-        source.followingCount ??
-        source.following_count ??
-        source.following
+        source.following,
+        source.followingCount,
+        source.following_count
       ),
 
       followers: numberOrNull(
-        source.followerCount ??
-        source.followersCount ??
-        source.follower_count ??
-        source.followers
+        source.followers,
+        source.followerCount,
+        source.follower_count,
+        source.fans
       ),
 
       likes: numberOrNull(
-        source.heartCount ??
-        source.likesCount ??
-        source.heart ??
-        source.likes
+        source.likes,
+        source.likesCount,
+        source.heart,
+        source.heartCount,
+        source.heart_count,
+        source.total_favorited
       ),
 
       bio: String(
-        source.signature ||
-        source.bio ||
-        source.description ||
-        ""
+        firstValue(
+          source.bio,
+          source.signature,
+          source.description,
+          ""
+        )
       ),
 
       verified: booleanValue(
-        source.verified ??
-        source.isVerified ??
+        source.verified,
+        source.isVerified,
         source.is_verified
       )
     };
 
-    return {
-      statusCode: 200,
-      headers: {
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        ok: true,
-        source: "tiktok-user-info-api",
-        profile: profile
-      })
-    };
-  } catch (error) {
-    return {
-      statusCode: 500,
-      body: JSON.stringify({
+    if (!profile.handle || !profile.name) {
+      return reply(404, {
         ok: false,
-        error: "Server error"
-      })
-    };
+        error: "Profile not found"
+      });
+    }
+
+    return reply(200, {
+      ok: true,
+
+      // Es importante que diga exactamente "tiktok".
+      // La página actual comprueba este valor.
+      source: "tiktok",
+
+      profile
+    });
+  } catch (error) {
+    return reply(500, {
+      ok: false,
+      error: "Server error"
+    });
   }
 };
