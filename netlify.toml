@@ -1,0 +1,9 @@
+# Netlify config
+[build]
+  functions = "netlify/functions"
+
+# Make /api/tiktok-profile point to the serverless function
+[[redirects]]
+  from = "/api/*"
+  to = "/.netlify/functions/:splat"
+  status = 200
